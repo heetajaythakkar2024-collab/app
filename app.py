@@ -1,123 +1,150 @@
-import os
-from flask import Flask, jsonify, request
-from flask_cors import CORS
 import hashlib
 import json
 from time import time
-import random
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
-# --- BLOCKCHAIN STRUCTURE ---
+# --- PART 1: The Core Blockchain Logic ---
+
+class Transaction:
+    def __init__(self, sender, recipient, amount):
+        self.sender = sender
+        self.recipient = recipient
+        self.amount = amount
+
+    def to_dict(self):
+        return {
+            'sender': self.sender,
+            'recipient': self.recipient,
+            'amount': self.amount
+        }
+
 class Block:
-    def __init__(self, index, timestamp, data, previous_hash):
+    def __init__(self, index, transactions, timestamp, previous_hash, nonce=0):
         self.index = index
+        self.transactions = transactions
         self.timestamp = timestamp
-        self.data = data
         self.previous_hash = previous_hash
-        self.hash = self.calculate_hash()
+        self.nonce = nonce
+        self.hash = self.compute_hash()
 
-    def calculate_hash(self):
-        """Creates a unique SHA-256 fingerprint for the block."""
+    def compute_hash(self):
         block_string = json.dumps({
             "index": self.index,
+            "transactions": [tx.to_dict() for tx in self.transactions],
             "timestamp": self.timestamp,
-            "data": self.data,
-            "previous_hash": self.previous_hash
-        }, sort_keys=True).encode()
-        return hashlib.sha256(block_string).hexdigest()
+            "previous_hash": self.previous_hash,
+            "nonce": self.nonce
+        }, sort_keys=True)
+        return hashlib.sha256(block_string.encode()).hexdigest()
 
-class WalletLinkingBlockchain:
+class Blockchain:
     def __init__(self):
-        self.chain = [self.create_genesis_block()]
-        # Automatically add fake data on startup for the demo
-        self.seed_data()
+        self.unconfirmed_transactions = []
+        self.chain = []
+        self.difficulty = 2
+        self.create_genesis_block()
 
     def create_genesis_block(self):
-        return Block(0, time(), "Genesis Block - System Init", "0")
+        genesis_block = Block(0, [], time(), "0")
+        self.proof_of_work(genesis_block)
+        self.chain.append(genesis_block)
 
-    def get_latest_block(self):
+    @property
+    def last_block(self):
         return self.chain[-1]
 
-    def add_block(self, user_id, wallet_address):
-        """Creates a new block and adds it to the chain."""
-        new_block = Block(
-            index=len(self.chain),
-            timestamp=time(),
-            data={"user_id": user_id, "wallet_address": wallet_address},
-            previous_hash=self.get_latest_block().hash
-        )
-        self.chain.append(new_block)
-        return new_block
+    def add_transaction(self, transaction):
+        self.unconfirmed_transactions.append(transaction)
 
-    def seed_data(self):
-        """Adds fake data so the blockchain looks active for the demo."""
-        dummy_data = [
-            ("Volunteer_Alice", "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"),
-            ("Eco_Warrior_99", "0x89205A3A3b2A69De6Dbf7f01ED13B2108B2c43e7"),
-            ("Student_VIT_22", "0x409B0aCfFe820C0769397E4F23D26F7F0A805566"),
-            ("CleanCity_Bot", "0x2546BcD3c84621E976D8185a91A922aE77ECE030"),
-            ("Green_Team_Lead", "0xb794F5eA0ba39494cE839613fffBA74279579268")
-        ]
-        
-        print("🌱 Seeding Blockchain with existing data...")
-        for user, wallet in dummy_data:
-            self.add_block(user, wallet)
-        print("✅ Blockchain seeded with 5 blocks.")
+    def proof_of_work(self, block):
+        block.nonce = 0
+        computed_hash = block.compute_hash()
+        while not computed_hash.startswith('0' * self.difficulty):
+            block.nonce += 1
+            computed_hash = block.compute_hash()
+        block.hash = computed_hash
+        return computed_hash
 
-# --- API SERVER SETUP ---
+    def mine(self):
+        if not self.unconfirmed_transactions:
+            return False
+
+        last_block = self.last_block
+        new_block = Block(index=last_block.index + 1,
+                          transactions=self.unconfirmed_transactions,
+                          timestamp=time(),
+                          previous_hash=last_block.hash)
+
+        self.proof_of_work(new_block)
+        self.add_block(new_block)
+        self.unconfirmed_transactions = []
+        return new_block.index
+
+    def add_block(self, block):
+        previous_hash = self.last_block.hash
+        if previous_hash != block.previous_hash:
+            return False
+        if not self.is_valid_proof(block, block.hash):
+            return False
+        self.chain.append(block)
+        return True
+
+    def is_valid_proof(self, block, block_hash):
+        return (block_hash.startswith('0' * self.difficulty) and
+                block_hash == block.compute_hash())
+
+
+# --- PART 2: The Web Server (Flask) ---
+
 app = Flask(__name__)
-# Allow requests from ANY website (Critical for your frontend to work)
-CORS(app) 
+CORS(app)  # This enables Cross-Origin Resource Sharing
 
-# Initialize the Blockchain
-blockchain = WalletLinkingBlockchain()
+# Initialize the blockchain object
+blockchain = Blockchain()
 
-# --- ROUTES ---
-
-@app.route('/', methods=['GET'])
-def home():
-    """Simple check to see if server is online."""
-    return "CivicFlow Blockchain API is Running!", 200
-
-@app.route('/add_event', methods=['POST'])
-def add_event():
-    """Receives data from Frontend and mines a block."""
-    values = request.get_json()
-    
-    # Validation: Ensure the frontend sent the right data
-    required = ['user_id', 'wallet_address']
-    if not values or not all(k in values for k in required):
-        return jsonify({'message': 'Missing values'}), 400
-
-    # Mine the block
-    block = blockchain.add_block(values['user_id'], values['wallet_address'])
-    
-    response = {
-        'message': 'Event recorded to Blockchain',
-        'index': block.index,
-        'hash': block.hash,
-        'previous_hash': block.previous_hash,
-        'timestamp': block.timestamp
-    }
-    return jsonify(response), 201
-
-@app.route('/get_chain', methods=['GET'])
+@app.route('/chain', methods=['GET'])
 def get_chain():
-    """Returns the full blockchain history."""
+    """Returns the full blockchain data."""
     chain_data = []
     for block in blockchain.chain:
         chain_data.append({
             'index': block.index,
             'timestamp': block.timestamp,
-            'data': block.data,
+            'transactions': [t.to_dict() for t in block.transactions],
             'hash': block.hash,
-            'previous_hash': block.previous_hash
+            'previous_hash': block.previous_hash,
+            'nonce': block.nonce
         })
-    return jsonify({'chain': chain_data, 'length': len(chain_data)}), 200
+    return jsonify({"length": len(chain_data), "chain": chain_data}), 200
 
-# --- SERVER START ---
+@app.route('/mine', methods=['GET'])
+def mine_unconfirmed_transactions():
+    """Mines pending transactions into a new block."""
+    result = blockchain.mine()
+    if not result:
+        return jsonify({"message": "No transactions to mine"}), 400
+    return jsonify({"message": f"Block #{result} mined successfully!"}), 200
+
+@app.route('/transactions/new', methods=['POST'])
+def new_transaction():
+    """Adds a new transaction to the pool."""
+    values = request.get_json()
+    
+    # Check that the required fields are in the POST'ed data
+    required = ['sender', 'recipient', 'amount']
+    if not all(k in values for k in required):
+        return 'Missing values', 400
+
+    # Create a new Transaction
+    tx = Transaction(values['sender'], values['recipient'], values['amount'])
+    blockchain.add_transaction(tx)
+    
+    return jsonify({"message": "Transaction will be added to the next block"}), 201
+
+# --- PART 3: Start the Server ---
+
 if __name__ == '__main__':
-    # Use the PORT environment variable provided by Render, or default to 5000
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-
-
+    # Run the Flask server locally on port 5000
+    print("Starting Blockchain Server on port 5000...")
+    app.run(host='0.0.0.0', port=5000, debug=True)
